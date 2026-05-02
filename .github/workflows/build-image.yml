@@ -7,7 +7,6 @@ on:
   workflow_dispatch:
 
 env:
-  # Opt into Node.js 24 to avoid deprecation warnings on the runner
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
