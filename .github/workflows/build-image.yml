@@ -1,0 +1,131 @@
+name: Build SD Image (aarch64)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  # Opt into Node.js 24 to avoid deprecation warnings on the runner
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build-sdimage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix (single-user)
+        uses: cachix/install-nix-action@v17
+        with:
+          nix_path: nixpkgs=github:NixOS/nixpkgs/nixos-23.11
+
+      - name: Set up QEMU for aarch64 builds
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y qemu-user-static binfmt-support
+          sudo systemctl restart systemd-binfmt || true
+
+      - name: Show environment and versions (debug)
+        run: |
+          echo "Runner: $(uname -a)"
+          echo "User: $(whoami)"
+          echo "Nix version:"
+          nix --version || true
+          echo "Git commit:"
+          git rev-parse --verify HEAD || true
+
+      - name: Flake preflight: show available outputs
+        run: |
+          set -euo pipefail
+          echo "Listing flake outputs (this helps verify the flake is valid):"
+          nix --extra-experimental-features 'nix-command flakes' flake show --json > flake-show.json
+          echo "flake show saved to flake-show.json"
+          jq -r 'keys[]' flake-show.json || true
+
+      - name: Flake attribute check for aarch64 target
+        id: flake-check
+        run: |
+          set -euo pipefail
+          echo "Verifying the flake provides the expected aarch64 attribute..."
+          nix --extra-experimental-features 'nix-command flakes' eval --raw --json .#nixosConfigurations.rpi400.config.system.build.sdImage --system aarch64-linux > /dev/null || {
+            echo "ERROR: The flake does not expose .#nixosConfigurations.rpi400.config.system.build.sdImage for aarch64-linux."
+            echo "Run 'nix flake show' locally to inspect outputs."
+            exit 1
+          }
+          echo "Attribute exists for aarch64-linux."
+
+      - name: Build sdImage via flake (aarch64)
+        env:
+          NIXPKGS_ALLOW_UNSUPPORTED_SYSTEM: "1"
+        run: |
+          set -euo pipefail
+          echo "Starting nix flake build for rpi400 sdImage (target aarch64-linux)..."
+          nix --extra-experimental-features 'nix-command flakes' build .#nixosConfigurations.rpi400.config.system.build.sdImage --print-out-paths --system aarch64-linux
+          echo "Build command finished."
+
+      - name: Inspect result directory (debug)
+        run: |
+          set -euo pipefail
+          echo "Workspace root listing:"
+          ls -la
+          echo "Result listing (if present):"
+          ls -la result || true
+          echo "Result sd-image listing (if present):"
+          ls -la result/sd-image || true
+
+      - name: Locate image file and produce checksum
+        id: locate
+        run: |
+          set -euo pipefail
+          IMG=""
+          for candidate in result/sd-image/*.img result/*.img result/*.img.gz result; do
+            for f in $candidate; do
+              if [ -f "$f" ]; then
+                case "$f" in
+                  *.img) IMG="$f"; break 2 ;;
+                  *.img.gz) IMG="$f"; break 2 ;;
+                  result) IMG="$f"; break 2 ;;
+                esac
+              fi
+            done
+          done
+
+          if [ -z "$IMG" ]; then
+            echo "ERROR: No image file found in result paths."
+            echo "Contents of result for debugging:"
+            ls -la result || true
+            exit 1
+          fi
+
+          IMG_PATH=$(readlink -f "$IMG")
+          echo "Found image: $IMG_PATH"
+          echo "img=$IMG_PATH" >> "$GITHUB_OUTPUT"
+
+          sha256sum "$IMG_PATH" | awk '{print $1 "  " $2}' > image.sha256
+          echo "checksum_file=$(readlink -f image.sha256)" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d' ' -f1 image.sha256)" >> "$GITHUB_OUTPUT"
+
+          SIZE_BYTES=$(stat -c%s "$IMG_PATH")
+          echo "size_bytes=$SIZE_BYTES" >> "$GITHUB_OUTPUT"
+          if [ "$SIZE_BYTES" -lt 100000000 ]; then
+            echo "ERROR: Image size appears too small (<100MB): $SIZE_BYTES bytes"
+            exit 1
+          fi
+
+      - name: Upload SD image artifact and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpi400-sdimage
+          path: |
+            ${{ steps.locate.outputs.img }}
+            ${{ steps.locate.outputs.checksum_file }}
+
+      - name: Output verification summary
+        run: |
+          echo "Build finished. Image path: ${{ steps.locate.outputs.img }}"
+          echo "SHA256: ${{ steps.locate.outputs.sha256 }}"
+          echo "Size (bytes): ${{ steps.locate.outputs.size_bytes }}"
